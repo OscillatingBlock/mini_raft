@@ -1,30 +1,34 @@
-use crate::server::LogEntry;
+use std::{collections::HashMap, sync::RwLock};
 
 pub trait StateMachine: Send + Sync {
-    fn get_last_log_index(&self) -> u64;
-    //TODO: make log entry type
-    fn apply_log(&self, log_entry: LogEntry);
+    fn apply_log(&self, key: String, value: String) -> anyhow::Result<()>;
+    fn get_value(&self, key: String) -> Option<String>;
+    fn delete_key(&self, key: String) -> anyhow::Result<()>;
 }
 
-pub struct MockStateMachine {
-    last_log_index: u64,
+pub struct SimpleStateMachine {
+    data_store: RwLock<HashMap<String, String>>,
 }
 
-impl MockStateMachine {
+impl SimpleStateMachine {
     pub fn new() -> Self {
-        Self { last_log_index: 0 }
+        Self {
+            data_store: RwLock::new(HashMap::new()),
+        }
     }
 }
 
-impl StateMachine for MockStateMachine {
-    fn get_last_log_index(&self) -> u64 {
-        self.last_log_index
+impl StateMachine for SimpleStateMachine {
+    fn apply_log(&self, key: String, value: String) -> anyhow::Result<()> {
+        self.data_store.write().unwrap().insert(key, value);
+        Ok(())
+    }
+    fn get_value(&self, key: String) -> Option<String> {
+        self.data_store.read().unwrap().get(&key).cloned()
     }
 
-    fn apply_log(&self, log_entry: LogEntry) {
-        //     self.last_log_index += 1;
-        //     println!("Applying log entry: {:?}", log_entry);
+    fn delete_key(&self, key: String) -> anyhow::Result<()> {
+        self.data_store.write().unwrap().remove(&key);
+        Ok(())
     }
 }
-
-struct SimpleStateMachine {}

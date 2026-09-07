@@ -1,13 +1,16 @@
 use crate::{
-    codec::{AppendEntries, AppendEntriesResponse, Message, RequestVote, RequestVoteResponse},
+    codec::{
+        AppendEntries, AppendEntriesResponse, ClientRequest, ClientResponse, Message, RequestVote,
+        RequestVoteResponse,
+    },
     config::ServerConfig,
 };
 use rand::RngExt;
 use std::{sync::Arc, time::Duration};
 
-use anyhow::Context;
+use anyhow::{Context, Ok};
 use tokio::{
-    sync::mpsc::{self, error::SendError},
+    sync::mpsc::{self},
     time::Instant,
 };
 use tracing::{debug, field::debug, info, instrument, warn};
@@ -20,7 +23,7 @@ pub struct Server {
     state: ServerState,
     config: ServerConfig,
     to_network: mpsc::Sender<Outgoing>,
-    from_network: tokio::sync::Mutex<mpsc::Receiver<Message>>,
+    from_network: tokio::sync::Mutex<mpsc::Receiver<Incoming>>,
     log: Vec<LogEntry>,
 }
 
@@ -31,13 +34,13 @@ pub struct ServerState {
 
     current_term: u32,
     voted_for: Option<NodeId>,
-    // log: Vec<String>,
-    //
-    commit_index: u32,
-    last_applied: u32,
+    commit_index: i32,
+    last_applied: i32,
 
     next_index: Vec<u64>,
-    match_index: Vec<u64>,
+    match_index: Vec<i32>,
+    //highest log index sent to follower in the current AppendEntries rpc
+    last_sent_index: Vec<i32>,
 
     last_heartbeat: Instant,
 
@@ -45,31 +48,48 @@ pub struct ServerState {
 }
 
 impl ServerState {
-    pub fn new(state_machine: Arc<dyn StateMachine>) -> Self {
+    pub fn new(state_machine: Arc<dyn StateMachine>, num_peers: usize) -> Self {
+        let last_sent_index = vec![0; num_peers];
+        let next_index = vec![0; num_peers];
+        let match_index = vec![-1 as i32; num_peers];
         Self {
             state: RaftState::Follower,
             state_machine,
             current_term: 0,
             voted_for: None,
-            commit_index: 0,
-            last_applied: 0,
-            next_index: vec![],
-            match_index: vec![],
+            //we use sentinel value -1 for commit_index, last_applied
+            //-1 -> uncommited state
+            commit_index: -1,
+            //-1 -> No logs applied
+            last_applied: -1,
+            next_index: next_index,
+            //all index set to -1 to represent no logs commited on followers yet
+            match_index: match_index,
+            last_sent_index: last_sent_index,
             last_heartbeat: Instant::now(),
             votes_received: 0,
         }
     }
 }
 
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Debug, Clone)]
 pub enum RaftState {
     Follower,
     Candidate,
     Leader,
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, Eq, Hash)]
 pub struct NodeId(u32);
+
+impl NodeId {
+    fn as_u64(&self) -> u64 {
+        return self.0 as u64;
+    }
+    fn as_usize(&self) -> usize {
+        return self.0 as usize;
+    }
+}
 
 impl std::fmt::Display for NodeId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -85,31 +105,41 @@ impl NodeId {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LogEntry {
-    pub leader_id: u32,
-    pub server_id: u32,
     pub term: u32,
     pub command: LogCommand,
-    pub data: u32,
     pub index: u32,
+    pub client_id: u32,
+    pub request_id: u32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum LogCommand {
-    Noop,
-    Set,
-    Delete,
+    Set { key: String, value: String },
+    Get { key: String },
+    Delete { key: String },
 }
 
 #[allow(dead_code)]
 enum Destination {
+    Client(ClientId),
     Leader,
     Node(NodeId),
     Broadcast,
 }
 
 #[allow(dead_code)]
+pub struct ClientId(u32);
+
+#[allow(dead_code)]
 struct Outgoing {
     dest: Destination,
+    msg: Message,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+struct Incoming {
+    from: NodeId,
     msg: Message,
 }
 
@@ -120,10 +150,10 @@ impl Server {
         config: ServerConfig,
         state_machine: Arc<dyn StateMachine>,
         to_network: mpsc::Sender<Outgoing>,
-        from_network: mpsc::Receiver<Message>,
+        from_network: mpsc::Receiver<Incoming>,
     ) -> Server {
         info!("initializing new server node");
-        let state = ServerState::new(state_machine);
+        let state = ServerState::new(state_machine, config.total_nodes as usize);
         let from_network = tokio::sync::Mutex::new(from_network);
         Self {
             id,
@@ -150,7 +180,8 @@ impl Server {
     #[instrument(skip(self), fields(node_id = %self.id))]
     async fn follower(&mut self) {
         info!("entering follower state");
-        self.apply_latest_commited_logs().await;
+        self.apply_latest_commited_logs(self.state.commit_index)
+            .await;
         let timeout_duration = self.config.election_timeout;
 
         loop {
@@ -213,7 +244,7 @@ impl Server {
             last_log_index: if self.log.is_empty() {
                 0
             } else {
-                self.log.len() as u32 - 1
+                self.log.len() as i32 - 1
             },
             last_log_term: if self.log.is_empty() {
                 0
@@ -231,19 +262,39 @@ impl Server {
     #[instrument(skip(self), fields(node_id = %self.id))]
     async fn leader(&mut self) {
         info!("entering leader state");
-        self.apply_latest_commited_logs().await;
+        self.apply_latest_commited_logs(self.state.commit_index)
+            .await;
 
         // upon election send first heartbeat to all peers
         self.send_heartbeat().await;
 
+        self.state
+            .match_index
+            .resize(self.config.total_nodes as usize, -1);
+        self.state
+            .next_index
+            .resize(self.config.total_nodes as usize, 0);
+
+        for i in 0..self.config.total_nodes {
+            self.state.next_index[i as usize] = if self.state.last_applied < 0 {
+                0
+            } else {
+                self.state.last_applied as u64 + 1
+            };
+        }
+
         loop {
-            self.manage_follower_logs().await;
             self.handle_commit_index().await;
 
             tokio::select! {
                 _ = set_timer(self.config.heartbeat_interval) => {
-                    debug!("heartbeat interval reached, sending heartbeat");
-                    self.send_heartbeat().await;
+                    if self.state.state == RaftState::Leader {
+                        debug!("heartbeat interval reached, sending heartbeat");
+                        self.send_heartbeat().await;
+                    }else {
+                        debug!("breaking heartbeat loop");
+                        break;
+                    }
                 }
 
                 _ = self.recieve_rpc() => {
@@ -263,11 +314,7 @@ impl Server {
         let heartbeat_msg = Message::AppendEntriesType(AppendEntries {
             term: self.state.current_term,
             leader_id: self.id.clone(),
-            prev_log_index: if self.log.is_empty() {
-                0
-            } else {
-                self.log.len() as u32 - 1
-            },
+            prev_log_index: self.log.len() as i32 - 1,
             prev_log_term: if self.log.is_empty() {
                 0
             } else {
@@ -294,17 +341,17 @@ impl Server {
             .context("channel closed")?;
 
         debug!(
-            message_type = msg.message_type(),
+            message_type = msg.msg.message_type(),
             "received rpc message from network"
         );
 
-        match msg {
+        match msg.msg {
             Message::AppendEntriesType(append_entries_msg) => {
                 self.handle_append_entries(append_entries_msg).await?;
             }
 
             Message::AppendEntriesResponseType(_) => {
-                debug!("received append entries response");
+                self.handle_append_entries_response(msg).await?;
             }
 
             Message::RequestVoteType(request_vote_msg) => {
@@ -315,6 +362,11 @@ impl Server {
                 self.handle_request_vote_response_rpc(request_vote_response_msg)
                     .await;
             }
+
+            Message::ClientRequestType(client_request) => {
+                self.handle_client_request(client_request).await?;
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -346,7 +398,15 @@ impl Server {
         }
 
         // if we are leader and msg term higher than our current term, then become follower
+        let prev_state = self.state.state.clone();
         self.change_state_if_higher_term(&msg);
+        let new_state = self.state.state.clone();
+
+        if prev_state != new_state {
+            return Ok(());
+        }
+
+        self.apply_latest_commited_logs(msg.leader_commit).await;
 
         if msg.entries.is_empty() {
             debug!("received valid empty heartbeat from leader");
@@ -362,7 +422,8 @@ impl Server {
         // min(leaderCommit, index of last new entry)
         if msg.leader_commit > self.state.commit_index {
             let last_new_entry_index = msg.entries[msg.entries.len() - 1].index;
-            self.state.commit_index = std::cmp::min(msg.leader_commit, last_new_entry_index as u32);
+            self.state.commit_index = std::cmp::min(msg.leader_commit, last_new_entry_index as i32);
+
             debug!(
                 commit_index = self.state.commit_index,
                 "updated local commit index"
@@ -463,23 +524,28 @@ impl Server {
     }
 
     fn change_state_if_higher_term(&mut self, msg: &AppendEntries) {
+        let prev_state = self.state.state.clone();
         if msg.term > self.state.current_term {
-            info!(
-                old_term = self.state.current_term,
-                new_term = msg.term,
-                "discovered higher term, stepping down to follower"
-            );
             self.state.current_term = msg.term;
             self.state.state = RaftState::Follower;
-        } else if msg.term == self.state.current_term && self.state.state == RaftState::Candidate {
-            //if we are candidate, and recieved heartbeat or new entries from leader with higher term, then
-            //become follower
-            info!(
-                old_term = self.state.current_term,
-                new_term = msg.term,
-                "candidate discovered leader, stepping down to follower"
-            );
-            self.state.state = RaftState::Follower;
+
+            match prev_state {
+                RaftState::Leader => {
+                    info!(
+                        old_term = self.state.current_term,
+                        new_term = msg.term,
+                        "discovered higher term, stepping down to follower"
+                    );
+                }
+                RaftState::Candidate => {
+                    info!(
+                        old_term = self.state.current_term,
+                        new_term = msg.term,
+                        "candidate discovered leader, stepping down to follower"
+                    );
+                }
+                _ => {}
+            }
         }
     }
 
@@ -534,7 +600,7 @@ impl Server {
         match self.state.voted_for {
             Some(ref voted_for) => {
                 if voted_for != &msg.candidate_id
-                    || msg.last_log_index < self.log[self.log.len() - 1].index
+                    || msg.last_log_index < self.log[self.log.len() - 1].index as i32
                     || msg.last_log_term != self.log[self.log.len() - 1].term
                 {
                     debug!(
@@ -597,31 +663,284 @@ impl Server {
     }
 
     #[instrument(skip(self), fields(node_id = %self.id))]
-    async fn manage_follower_logs(&self) {
-        for (_i, next_index) in self.state.next_index.iter().enumerate() {
-            let last_log_index = self.state.state_machine.get_last_log_index();
-            if last_log_index > *next_index {
-                debug!(next_index = *next_index, "managing follower logs");
-                // send AppendEntries RPC with log entries starting at nextIndex
-            }
-        }
-    }
-
-    #[instrument(skip(self), fields(node_id = %self.id))]
     async fn handle_commit_index(&self) {}
 
     // applies latest commited logs to state machine
     #[instrument(skip(self), fields(node_id = %self.id))]
-    async fn apply_latest_commited_logs(&mut self) {
-        if self.state.commit_index > self.state.last_applied {
-            self.state.last_applied += 1;
-            debug!(
-                last_applied = self.state.last_applied,
-                "applying committed log to state machine"
-            );
-            let log = self.log[self.state.last_applied as usize].clone();
-            self.state.state_machine.apply_log(log);
+    async fn apply_latest_commited_logs(&mut self, leader_commit: i32) {
+        if leader_commit > self.state.commit_index {
+            self.state.commit_index = leader_commit;
+            if self.state.commit_index > self.state.last_applied {
+                for i in self.state.commit_index..self.state.last_applied {
+                    let log = self.log.get(i as usize);
+                    let Some(log) = log else {
+                        continue;
+                    };
+
+                    self.state.last_applied += 1;
+                    debug!(
+                        last_applied = self.state.last_applied,
+                        "applying committed log to state machine"
+                    );
+                    match log.command.clone() {
+                        LogCommand::Set { key, value } => {
+                            self.state.state_machine.apply_log(key, value);
+                        }
+                        LogCommand::Delete { key } => {
+                            self.state.state_machine.delete_key(key);
+                        }
+                        _ => {}
+                    }
+                }
+            }
         }
+    }
+
+    #[instrument(skip(self, msg), fields(node_id = %self.id, client_id = msg.client_id, request_id = msg.request_id))]
+    async fn handle_client_request(&mut self, msg: ClientRequest) -> anyhow::Result<()> {
+        if self.state.state != RaftState::Leader {
+            debug!("ignoring client request: node is not the leader");
+            return Ok(());
+        }
+
+        info!("handling incoming client request");
+
+        // append command to our log
+        match msg.command {
+            LogCommand::Set { ref key, ref value } => {
+                debug!(key = %key, value = %value, "processing client set command");
+                self.handle_set_command(key.clone(), value.clone(), msg.client_id, msg.request_id)
+                    .await?;
+            }
+            _ => {
+                debug!("unhandled client command type");
+            }
+        };
+
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(node_id = %self.id, client_id = client_id, request_id = request_id))]
+    async fn handle_set_command(
+        &mut self,
+        key: String,
+        value: String,
+        client_id: u32,
+        request_id: u32,
+    ) -> anyhow::Result<()> {
+        let log_entry = LogEntry {
+            term: self.state.current_term,
+            index: self.log.len() as u32,
+            command: LogCommand::Set {
+                key: key.clone(),
+                value: value.clone(),
+            },
+            client_id,
+            request_id,
+        };
+
+        info!(
+            log_index = log_entry.index,
+            term = log_entry.term,
+            "appending set command to local log"
+        );
+        self.log.push(log_entry.clone());
+
+        for (peer_id, _) in &self.config.peer_addresses {
+            if *peer_id == self.id {
+                continue;
+            }
+            let i = peer_id.as_usize();
+            let prev_log_index = if self.state.next_index[i] == 0 {
+                -1 as i32
+            } else {
+                self.state.next_index[i] as i32 - 1
+            };
+            let prev_log_term = if prev_log_index == -1 {
+                0
+            } else {
+                self.log[prev_log_index as usize].term
+            };
+            self.state.last_sent_index[i] = self.log.len() as i32 - 1;
+
+            debug!(peer_id = ?peer_id, prev_log_index = prev_log_index, "broadcasting append entries to peer for new log entry");
+            self.to_network
+                .send(Outgoing {
+                    dest: Destination::Broadcast,
+                    msg: Message::AppendEntriesType(AppendEntries {
+                        term: self.state.current_term,
+                        leader_id: self.id,
+                        prev_log_index,
+                        prev_log_term,
+                        entries: vec![log_entry.clone()],
+                        leader_commit: self.state.commit_index,
+                    }),
+                })
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    #[instrument(skip(self, incoming), fields(node_id = %self.id))]
+    async fn handle_append_entries_response(&mut self, incoming: Incoming) -> anyhow::Result<()> {
+        let msg = incoming.msg;
+        let Message::AppendEntriesResponseType(msg) = msg else {
+            return Ok(());
+        };
+
+        if self.state.state != RaftState::Leader {
+            debug!("ignoring append entries response: node is no longer leader");
+            return Ok(());
+        }
+
+        debug!(peer_id = ?incoming.from, success = msg.success, term = msg.term, "received append entries response from peer");
+
+        // If RPC response contains term T > currentTerm:
+        // set currentTerm = T, convert to follower
+        if msg.term > self.state.current_term {
+            info!(
+                old_term = self.state.current_term,
+                new_term = msg.term,
+                "discovered higher term in append entries response, becoming follower"
+            );
+            self.state.current_term = msg.term;
+            self.state.state = RaftState::Follower;
+            self.state.voted_for = None;
+            self.state.votes_received = 0;
+
+            return Ok(());
+        }
+
+        let i = incoming.from.as_usize();
+
+        if msg.success {
+            // If successful: update nextIndex and matchIndex for follower
+            self.state.match_index[i] = self.state.last_sent_index[i];
+            self.state.next_index[i] = self.state.match_index[i] as u64 + 1;
+            debug!(
+                peer_id = ?incoming.from,
+                match_index = self.state.match_index[i],
+                next_index = self.state.next_index[i],
+                "updated follower indices on successful replication"
+            );
+        } else {
+            // If AppendEntries fails because of log inconsistency: decrement nextIndex and retry
+            self.state.next_index[i] = if self.state.next_index[i] > 0 {
+                self.state.next_index[i] - 1
+            } else {
+                0
+            };
+            warn!(
+                peer_id = ?incoming.from,
+                new_next_index = self.state.next_index[i],
+                "append entries rejected due to log inconsistency, decrementing next_index and retrying"
+            );
+
+            let prev_log_index = self.state.next_index[i] as i32;
+            let prev_log_term = self.log[prev_log_index as usize].term;
+            let entries = self.log[self.state.next_index[i] as usize..].to_vec();
+
+            self.to_network
+                .send(Outgoing {
+                    dest: Destination::Node(incoming.from),
+                    msg: Message::AppendEntriesType(AppendEntries {
+                        term: self.state.current_term,
+                        leader_id: self.id,
+                        prev_log_index,
+                        entries,
+                        prev_log_term,
+                        leader_commit: self.state.commit_index,
+                    }),
+                })
+                .await?;
+        }
+
+        // If there exists an N such that N > commitIndex, a majority
+        // of matchIndex[i] ≥ N, and log[N].term == currentTerm:
+        // set commitIndex = N
+        let last_log_index = if self.log.is_empty() {
+            0
+        } else {
+            self.log.len() as i32 - 1
+        };
+
+        let start_index = self.state.commit_index + 1;
+
+        let mut commit_index_updated = false;
+        for n in start_index..=last_log_index {
+            debug!(
+                "checking if majority replication is achieved for log index {}",
+                n
+            );
+            if self.log[n as usize].term == self.state.current_term {
+                let mut match_count = 0;
+
+                for match_index in self.state.match_index.iter() {
+                    println!("match_index = {match_index}, match_count = {match_count}");
+                    if *match_index >= n {
+                        match_count += 1;
+                    }
+                }
+
+                let total_nodes = self.config.total_nodes;
+                if match_count > total_nodes / 2 - 1 {
+                    info!(
+                        new_commit_index = n,
+                        match_count = match_count,
+                        "majority replication achieved, advancing commit index"
+                    );
+                    self.state.commit_index = n;
+                    commit_index_updated = true;
+                    break;
+                }
+            }
+        }
+
+        if msg.success && commit_index_updated {
+            for n in self.state.last_applied + 1..=self.state.commit_index {
+                debug!(log_index = n, "applying committed log to state machine");
+                self.apply_latest_commited_logs(self.state.commit_index)
+                    .await;
+            }
+            self.state.last_applied = self.state.commit_index;
+            self.state.match_index[self.id.as_usize()] = self.state.commit_index;
+
+            let log_entry = match self.log.get(self.state.commit_index as usize) {
+                Some(entry) => entry,
+                None => return Ok(()),
+            };
+
+            let client_id = log_entry.client_id;
+            let request_id = log_entry.request_id;
+
+            let response_msg = match log_entry.command.clone() {
+                LogCommand::Set { .. } => Message::ClientResponseType(ClientResponse::SetSuccess {
+                    request_id: request_id as u64,
+                }),
+                LogCommand::Delete { .. } => {
+                    Message::ClientResponseType(ClientResponse::DeleteSuccess {
+                        request_id: request_id as u64,
+                        existed: true,
+                    })
+                }
+                _ => return Ok(()),
+            };
+
+            info!(
+                client_id = client_id,
+                request_id = request_id,
+                "sending success response back to client"
+            );
+            self.to_network
+                .send(Outgoing {
+                    dest: Destination::Client(ClientId(client_id)),
+                    msg: response_msg,
+                })
+                .await?;
+        }
+
+        Ok(())
     }
 }
 
@@ -633,28 +952,37 @@ async fn set_timer(timeout_duration: tokio::time::Duration) {
 mod tests {
 
     use super::*;
-    use crate::state_machine::MockStateMachine;
-    use std::sync::Arc;
+    use crate::state_machine::SimpleStateMachine;
+    use std::{collections::HashMap, sync::Arc};
 
     fn create_new_server_and_mock_msg_sender()
-    -> (Server, mpsc::Sender<Message>, mpsc::Receiver<Outgoing>) {
+    -> (Server, mpsc::Sender<Incoming>, mpsc::Receiver<Outgoing>) {
         println!("Creating new server and mock message sender");
         let _ = tracing_subscriber::fmt()
             .with_test_writer()
             .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
             .try_init();
 
-        let node_id = NodeId(1);
+        let mut peer_addreses = HashMap::new();
+        peer_addreses.insert(NodeId(0), "localhost:8080".to_string());
+
+        peer_addreses.insert(NodeId(1), "localhost:8080".to_string());
+        peer_addreses.insert(NodeId(2), "localhost:8080".to_string());
+        peer_addreses.insert(NodeId(3), "localhost:8080".to_string());
+
+        let node_id = NodeId(0);
         let config = ServerConfig {
             election_timeout: tokio::time::Duration::from_millis(200),
             heartbeat_interval: tokio::time::Duration::from_millis(50),
             address: "localhost:8080".to_string(),
             total_nodes: 5,
+            peer_addresses: peer_addreses,
         };
-        let state_machine = MockStateMachine::new();
-        let server_state_machine = ServerState::new(Arc::new(state_machine));
+        let state_machine = SimpleStateMachine::new();
+        let server_state_machine =
+            ServerState::new(Arc::new(state_machine), config.total_nodes as usize);
         let (node_tx, adapter_rx) = mpsc::channel::<Outgoing>(32); // Node → adapter
-        let (adapter_tx, node_rx) = mpsc::channel::<Message>(32); // adapter → Node
+        let (adapter_tx, node_rx) = mpsc::channel::<Incoming>(32); // adapter → Node
 
         let server = Server::new(
             node_id,
@@ -666,23 +994,28 @@ mod tests {
         (server, adapter_tx, adapter_rx)
     }
 
-    async fn populate_follower_log(mock_adapter_tx: &mpsc::Sender<Message>) {
+    async fn populate_follower_log(mock_adapter_tx: &mpsc::Sender<Incoming>) {
         mock_adapter_tx
-            .send(Message::AppendEntriesType(AppendEntries {
-                term: 1,
-                leader_id: NodeId(1),
-                prev_log_index: 0,
-                prev_log_term: 0,
-                entries: vec![LogEntry {
-                    leader_id: 1,
-                    server_id: 1,
+            .send(Incoming {
+                from: NodeId(67),
+                msg: Message::AppendEntriesType(AppendEntries {
                     term: 1,
-                    command: LogCommand::Set,
-                    data: 42,
-                    index: 0,
-                }],
-                leader_commit: 0,
-            }))
+                    leader_id: NodeId(1),
+                    prev_log_index: 0,
+                    prev_log_term: 0,
+                    entries: vec![LogEntry {
+                        term: 1,
+                        command: LogCommand::Set {
+                            key: "key".to_string(),
+                            value: "value".to_string(),
+                        },
+                        index: 0,
+                        client_id: 67,
+                        request_id: 67,
+                    }],
+                    leader_commit: 0,
+                }),
+            })
             .await
             .unwrap();
     }
@@ -701,14 +1034,17 @@ mod tests {
     async fn test_leader_heartbeat_prevents_follower_timeout() {
         let (mut server, mock_adapter_tx, _) = create_new_server_and_mock_msg_sender();
         mock_adapter_tx
-            .send(Message::AppendEntriesType(AppendEntries {
-                term: 1,
-                leader_id: NodeId(1),
-                prev_log_index: 0,
-                prev_log_term: 0,
-                entries: vec![],
-                leader_commit: 0,
-            }))
+            .send(Incoming {
+                from: NodeId(67),
+                msg: Message::AppendEntriesType(AppendEntries {
+                    term: 1,
+                    leader_id: NodeId(1),
+                    prev_log_index: 0,
+                    prev_log_term: 0,
+                    entries: vec![],
+                    leader_commit: 0,
+                }),
+            })
             .await
             .unwrap();
 
@@ -734,21 +1070,26 @@ mod tests {
 
         //send an AppendEntries RPC with a conflicting log entry
         mock_adapter_tx
-            .send(Message::AppendEntriesType(AppendEntries {
-                term: 1,
-                leader_id: NodeId(1),
-                prev_log_index: 1,
-                prev_log_term: 0,
-                entries: vec![LogEntry {
-                    leader_id: 1,
-                    server_id: 1,
+            .send(Incoming {
+                from: NodeId(67),
+                msg: Message::AppendEntriesType(AppendEntries {
                     term: 1,
-                    command: LogCommand::Set,
-                    data: 43,
-                    index: 0,
-                }],
-                leader_commit: 0,
-            }))
+                    leader_id: NodeId(1),
+                    prev_log_index: 1,
+                    prev_log_term: 0,
+                    entries: vec![LogEntry {
+                        term: 1,
+                        command: LogCommand::Set {
+                            key: "key".to_string(),
+                            value: "value".to_string(),
+                        },
+                        index: 0,
+                        client_id: 67,
+                        request_id: 67,
+                    }],
+                    leader_commit: 0,
+                }),
+            })
             .await
             .unwrap();
 
@@ -777,30 +1118,37 @@ mod tests {
 
         //send 2 valid AppendEntries RPC with  new log entry
         let first_log_entry = LogEntry {
-            leader_id: 1,
-            server_id: 1,
             term: 1,
-            command: LogCommand::Set,
-            data: 43,
+            command: LogCommand::Set {
+                key: "key".to_string(),
+                value: "value".to_string(),
+            },
             index: 1,
+            client_id: 67,
+            request_id: 67,
         };
         let second_log_entry = LogEntry {
-            leader_id: 1,
-            server_id: 1,
             term: 1,
-            command: LogCommand::Set,
-            data: 44,
+            command: LogCommand::Set {
+                key: "key".to_string(),
+                value: "value".to_string(),
+            },
             index: 2,
+            client_id: 67,
+            request_id: 67,
         };
         mock_adapter_tx
-            .send(Message::AppendEntriesType(AppendEntries {
-                term: 1,
-                leader_id: NodeId(1),
-                prev_log_index: 0,
-                prev_log_term: 1,
-                entries: vec![first_log_entry.clone(), second_log_entry.clone()],
-                leader_commit: 0,
-            }))
+            .send(Incoming {
+                from: NodeId(67),
+                msg: Message::AppendEntriesType(AppendEntries {
+                    term: 1,
+                    leader_id: NodeId(1),
+                    prev_log_index: 0,
+                    prev_log_term: 1,
+                    entries: vec![first_log_entry.clone(), second_log_entry.clone()],
+                    leader_commit: 0,
+                }),
+            })
             .await
             .unwrap();
         server.follower().await;
@@ -833,12 +1181,15 @@ mod tests {
         assert!(matches!(first_response.success, true));
 
         mock_adapter_tx
-            .send(Message::RequestVoteType(RequestVote {
-                term: 2,
-                candidate_id: NodeId(2),
-                last_log_index: 0,
-                last_log_term: 1,
-            }))
+            .send(Incoming {
+                from: NodeId(67),
+                msg: Message::RequestVoteType(RequestVote {
+                    term: 2,
+                    candidate_id: NodeId(2),
+                    last_log_index: 0,
+                    last_log_term: 1,
+                }),
+            })
             .await
             .unwrap();
         server.follower().await;
@@ -871,7 +1222,13 @@ mod tests {
             entries: vec![],
             leader_commit: 0,
         });
-        mock_adapter_tx.send(heartbeat).await.unwrap();
+        mock_adapter_tx
+            .send(Incoming {
+                from: NodeId(99),
+                msg: heartbeat,
+            })
+            .await
+            .unwrap();
 
         //candidate method should send request vote rpc to all peers
         server.candidate().await;
@@ -883,7 +1240,7 @@ mod tests {
         };
         assert_eq!(req.term, server.state.current_term);
         assert_eq!(req.candidate_id, server.id);
-        assert_eq!(req.last_log_index, server.log.len() as u32 - 1);
+        assert_eq!(req.last_log_index, server.log.len() as i32 - 1);
         assert_eq!(req.last_log_term, server.log[server.log.len() - 1].term);
     }
 
@@ -897,14 +1254,20 @@ mod tests {
 
         //already send an heartbeat so candidate loop ends in the next step when we start it
         let heartbeat = Message::AppendEntriesType(AppendEntries {
-            term: server.state.current_term + 1,
+            term: server.state.current_term + 2,
             leader_id: NodeId(1),
             prev_log_index: 0,
             prev_log_term: 1,
             entries: vec![],
             leader_commit: 0,
         });
-        mock_adapter_tx.send(heartbeat).await.unwrap();
+        mock_adapter_tx
+            .send(Incoming {
+                from: NodeId(99),
+                msg: heartbeat,
+            })
+            .await
+            .unwrap();
 
         server.candidate().await;
 
@@ -937,7 +1300,13 @@ mod tests {
             entries: vec![],
             leader_commit: 0,
         });
-        mock_adapter_tx.send(higher_term_msg).await.unwrap();
+        mock_adapter_tx
+            .send(Incoming {
+                from: NodeId(67),
+                msg: higher_term_msg,
+            })
+            .await
+            .unwrap();
 
         //start leader loop
         server.leader().await;
@@ -966,7 +1335,13 @@ mod tests {
                 leader_commit: 0,
             });
 
-            mock_adapter_tx.send(higher_term_msg).await.unwrap();
+            mock_adapter_tx
+                .send(Incoming {
+                    from: NodeId(67),
+                    msg: higher_term_msg,
+                })
+                .await
+                .unwrap();
         });
         server.leader().await;
 
@@ -987,7 +1362,7 @@ mod tests {
 
     async fn simulate_follower_becomes_leader(
         server: &mut Server,
-        mock_adapter_tx: &mpsc::Sender<Message>,
+        mock_adapter_tx: &mpsc::Sender<Incoming>,
         mock_adapter_rx: &mut mpsc::Receiver<Outgoing>,
     ) {
         //first make follower transition to candidate state by not sending any msg during its
@@ -997,10 +1372,13 @@ mod tests {
         //send majority votes to candidate
         for _ in 0..(server.config.total_nodes / 2) + 1 {
             mock_adapter_tx
-                .send(Message::RequestVoteResponseType(RequestVoteResponse {
-                    term: server.state.current_term,
-                    vote_granted: true,
-                }))
+                .send(Incoming {
+                    from: NodeId(67),
+                    msg: Message::RequestVoteResponseType(RequestVoteResponse {
+                        term: server.state.current_term,
+                        vote_granted: true,
+                    }),
+                })
                 .await
                 .unwrap();
         }
@@ -1012,4 +1390,263 @@ mod tests {
             _ = mock_adapter_rx.recv().await.unwrap();
         }
     }
+
+    #[tokio::test]
+    async fn test_leader_commits_on_quorom_majority() {
+        let (mut server, mock_adapter_tx, mut mock_adapter_rx) =
+            create_new_server_and_mock_msg_sender();
+
+        simulate_follower_becomes_leader(&mut server, &mock_adapter_tx, &mut mock_adapter_rx).await;
+
+        //first send client request, success response from nodes to leader in order
+        //also send highre term msg to stop leader later
+        let client_request = Incoming {
+            from: NodeId(67),
+            msg: Message::ClientRequestType(ClientRequest {
+                request_id: 67,
+                client_id: 6,
+                command: LogCommand::Set {
+                    key: "key".to_string(),
+                    value: "value".to_string(),
+                },
+            }),
+        };
+
+        let node_1_response = Incoming {
+            from: NodeId(1),
+            msg: Message::AppendEntriesResponseType(AppendEntriesResponse {
+                term: server.state.current_term,
+                success: true,
+            }),
+        };
+        let node_2_response = Incoming {
+            from: NodeId(2),
+            msg: Message::AppendEntriesResponseType(AppendEntriesResponse {
+                term: server.state.current_term,
+                success: true,
+            }),
+        };
+        let node_3_response = Incoming {
+            from: NodeId(3),
+            msg: Message::AppendEntriesResponseType(AppendEntriesResponse {
+                term: server.state.current_term,
+                success: true,
+            }),
+        };
+
+        let higher_term_msg = Incoming {
+            from: NodeId(67),
+            msg: Message::AppendEntriesType(AppendEntries {
+                term: server.state.current_term + 1,
+                leader_id: NodeId(4),
+                prev_log_index: 0,
+                prev_log_term: 1,
+                entries: vec![],
+                leader_commit: 0,
+            }),
+        };
+
+        let msg_to_send = vec![
+            client_request,
+            node_1_response,
+            node_2_response,
+            node_3_response,
+            higher_term_msg,
+        ];
+        for msg in msg_to_send {
+            mock_adapter_tx.send(msg).await.unwrap();
+        }
+
+        server.leader().await;
+        assert_eq!(server.state.commit_index, 0);
+    }
+
+    //test leader retires with reduced next index on log inconsistency
+    #[tokio::test]
+    async fn test_leader_retries_on_log_incosistency() {
+        let (mut server, mock_adapter_tx, mut mock_adapter_rx) =
+            create_new_server_and_mock_msg_sender();
+
+        simulate_follower_becomes_leader(&mut server, &mock_adapter_tx, &mut mock_adapter_rx).await;
+
+        //client sends request, leader sends AppendEntries rpcs,
+        //we simulate that only 2 nodes respond with success
+        let client_request1 = Incoming {
+            from: NodeId(67),
+            msg: Message::ClientRequestType(ClientRequest {
+                request_id: 67,
+                client_id: 6,
+                command: LogCommand::Set {
+                    key: "key".to_string(),
+                    value: "value".to_string(),
+                },
+            }),
+        };
+
+        let node_1_response = Incoming {
+            from: NodeId(1),
+            msg: Message::AppendEntriesResponseType(AppendEntriesResponse {
+                term: server.state.current_term,
+                success: true,
+            }),
+        };
+        let node_2_response = Incoming {
+            from: NodeId(2),
+            msg: Message::AppendEntriesResponseType(AppendEntriesResponse {
+                term: server.state.current_term,
+                success: true,
+            }),
+        };
+        //node 3 crashed, sends no response
+
+        let higher_term_msg = Incoming {
+            from: NodeId(67),
+            msg: Message::AppendEntriesType(AppendEntries {
+                term: server.state.current_term + 1,
+                leader_id: NodeId(4),
+                prev_log_index: 0,
+                prev_log_term: 1,
+                entries: vec![],
+                leader_commit: 0,
+            }),
+        };
+
+        let msg_to_send = vec![
+            client_request1,
+            node_1_response,
+            node_2_response,
+            higher_term_msg.clone(),
+        ];
+        for msg in msg_to_send {
+            mock_adapter_tx.send(msg).await.unwrap();
+        }
+        server.leader().await;
+
+        //at this point commit_index  should be equal to 0
+        assert_eq!(server.state.commit_index, 0);
+
+        warn!("changing node state back to leader, for running further test");
+        //after stopping leader state current node becomes Follower, make it leader again
+        server.state.state = RaftState::Leader;
+
+        //now client sends second request,after reciving this request leader sends AppendEntries rpc
+        //and leader discovers that node 3 is missing previous log [index 0]
+        //leader will reduce nextIndex for that node and send AppendEntries rpc with missing entries
+        //happens until prev_log_index matches [will match in just 1 round in this case]
+        let client_request2 = Incoming {
+            from: NodeId(69),
+            msg: Message::ClientRequestType(ClientRequest {
+                request_id: 69,
+                client_id: 7,
+                command: LogCommand::Set {
+                    key: "key2".to_string(),
+                    value: "value2".to_string(),
+                },
+            }),
+        };
+        let node_1_response2 = Incoming {
+            from: NodeId(1),
+            msg: Message::AppendEntriesResponseType(AppendEntriesResponse {
+                term: server.state.current_term,
+                success: true,
+            }),
+        };
+        let node_2_response2 = Incoming {
+            from: NodeId(2),
+            msg: Message::AppendEntriesResponseType(AppendEntriesResponse {
+                term: server.state.current_term,
+                success: true,
+            }),
+        };
+        //node 3 sends failure response
+        let node_3_second_log_failure = Incoming {
+            from: NodeId(3),
+            msg: Message::AppendEntriesResponseType(AppendEntriesResponse {
+                term: server.state.current_term,
+                success: false,
+            }),
+        };
+
+        //Node3 after recieving missing entries from leader in the latest appendEntries request
+        //will send success this time
+        let node_3_second_log_success = Incoming {
+            from: NodeId(3),
+            msg: Message::AppendEntriesResponseType(AppendEntriesResponse {
+                term: server.state.current_term,
+                success: true,
+            }),
+        };
+        let higher_term_msg = Incoming {
+            from: NodeId(67),
+            msg: Message::AppendEntriesType(AppendEntries {
+                term: server.state.current_term + 1,
+                leader_id: NodeId(4),
+                prev_log_index: 0,
+                prev_log_term: 1,
+                entries: vec![],
+                leader_commit: 0,
+            }),
+        };
+        let msg_to_send_again = vec![
+            client_request2,
+            node_1_response2,
+            node_2_response2,
+            node_3_second_log_failure,
+            node_3_second_log_success,
+            higher_term_msg,
+        ];
+        for msg in msg_to_send_again {
+            mock_adapter_tx.send(msg).await.unwrap();
+        }
+
+        server.leader().await;
+        assert_eq!(server.state.commit_index, 1);
+    }
+
+    #[tokio::test]
+    async fn test_leader_does_not_commit_log_from_previous_term() {
+        let (mut server, mock_adapter_tx, mut mock_adapter_rx) =
+            create_new_server_and_mock_msg_sender();
+
+        simulate_follower_becomes_leader(&mut server, &mock_adapter_tx, &mut mock_adapter_rx).await;
+
+        //increasing current term and commit index for testing
+        server.state.current_term += 1;
+        server.state.commit_index = 1;
+
+        //send a AppendEntriesResponse from previous term
+
+        mock_adapter_tx
+            .send(Incoming {
+                from: NodeId(3),
+                msg: Message::AppendEntriesResponseType(AppendEntriesResponse {
+                    term: server.state.current_term - 1,
+                    success: true,
+                }),
+            })
+            .await
+            .unwrap();
+        mock_adapter_tx
+            .send(Incoming {
+                from: NodeId(67),
+                msg: Message::AppendEntriesType(AppendEntries {
+                    term: server.state.current_term + 1,
+                    leader_id: NodeId(1),
+                    prev_log_index: 0,
+                    prev_log_term: 1,
+                    entries: vec![],
+                    leader_commit: 0,
+                }),
+            })
+            .await
+            .unwrap();
+
+        server.leader().await;
+
+        //assert that leader did not increase the commit index by accepting succcessful entry from
+        //prev term
+        assert_eq!(server.state.commit_index, 1);
+    }
+
+    //     async fn test_leader_applies_logs_in_correct_order_to_state_machine() {}
 }
