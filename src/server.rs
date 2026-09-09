@@ -5,10 +5,10 @@ use crate::{
     },
     config::ServerConfig,
 };
-use rand::RngExt;
-use std::{sync::Arc, time::Duration};
-
 use anyhow::{Context, Ok};
+use rand::RngExt;
+use serde::{Deserialize, Serialize};
+use std::{sync::Arc, time::Duration};
 use tokio::{
     sync::mpsc::{self},
     time::Instant,
@@ -16,6 +16,12 @@ use tokio::{
 use tracing::{debug, field::debug, info, instrument, warn};
 
 use crate::state_machine::StateMachine;
+
+#[derive(Clone, Debug, Copy)]
+pub enum Id {
+    Client(ClientId),
+    Peer(NodeId),
+}
 
 #[allow(dead_code)]
 pub struct Server {
@@ -79,7 +85,7 @@ pub enum RaftState {
     Leader,
 }
 
-#[derive(Clone, Copy, PartialEq, Debug, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, PartialOrd, Debug, Eq, Hash, Serialize, Deserialize)]
 pub struct NodeId(u32);
 
 impl NodeId {
@@ -103,7 +109,7 @@ impl NodeId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LogEntry {
     pub term: u32,
     pub command: LogCommand,
@@ -112,7 +118,7 @@ pub struct LogEntry {
     pub request_id: u32,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum LogCommand {
     Set { key: String, value: String },
     Get { key: String },
@@ -120,27 +126,27 @@ pub enum LogCommand {
 }
 
 #[allow(dead_code)]
-enum Destination {
+pub enum Destination {
     Client(ClientId),
-    Leader,
     Node(NodeId),
     Broadcast,
 }
 
 #[allow(dead_code)]
+#[derive(Eq, Hash, PartialEq, Debug, Clone, Serialize, Deserialize, Copy)]
 pub struct ClientId(u32);
 
 #[allow(dead_code)]
-struct Outgoing {
-    dest: Destination,
-    msg: Message,
+pub struct Outgoing {
+    pub dest: Destination,
+    pub msg: Message,
 }
 
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
-struct Incoming {
-    from: NodeId,
-    msg: Message,
+pub struct Incoming {
+    pub from: Id,
+    pub msg: Message,
 }
 
 #[allow(dead_code)]
@@ -347,7 +353,11 @@ impl Server {
 
         match msg.msg {
             Message::AppendEntriesType(append_entries_msg) => {
-                self.handle_append_entries(append_entries_msg).await?;
+                let incoming = Incoming {
+                    from: msg.from,
+                    msg: Message::AppendEntriesType(append_entries_msg),
+                };
+                self.handle_append_entries(incoming).await?;
             }
 
             Message::AppendEntriesResponseType(_) => {
@@ -371,15 +381,22 @@ impl Server {
         Ok(())
     }
 
-    #[instrument(skip(self, msg), fields(node_id = %self.id, term = msg.term))]
-    async fn handle_append_entries(&mut self, msg: AppendEntries) -> anyhow::Result<()> {
+    #[instrument(skip(self, incoming), fields(node_id = %self.id))]
+    async fn handle_append_entries(&mut self, incoming: Incoming) -> anyhow::Result<()> {
+        let msg = incoming.msg;
+        let Message::AppendEntriesType(msg) = msg else {
+            anyhow::bail!("expected append entries type")
+        };
         debug!("handling append entries message");
         let response = Message::AppendEntriesResponseType(AppendEntriesResponse {
             term: self.state.current_term,
             success: false,
         });
+        let Id::Peer(node_id) = incoming.from else {
+            return Ok(());
+        };
         let reply = Outgoing {
-            dest: Destination::Leader,
+            dest: Destination::Node(node_id),
             msg: response,
         };
         info!(term = self.state.current_term);
@@ -392,7 +409,9 @@ impl Server {
         }
 
         // Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
-        let matched = self.reply_false_if_prev_log_does_not_match(&msg).await?;
+        let matched = self
+            .reply_false_if_prev_log_does_not_match(&msg, node_id)
+            .await?;
         if !matched {
             return Ok(());
         }
@@ -435,7 +454,7 @@ impl Server {
             success: true,
         });
         let outgoing_msg = Outgoing {
-            dest: Destination::Leader,
+            dest: Destination::Node(node_id),
             msg: response,
         };
         self.to_network.send(outgoing_msg).await?;
@@ -482,6 +501,7 @@ impl Server {
     async fn reply_false_if_prev_log_does_not_match(
         &mut self,
         msg: &AppendEntries,
+        leader_id: NodeId,
     ) -> anyhow::Result<bool> {
         let mut prev_log_index_matching = true;
 
@@ -505,7 +525,7 @@ impl Server {
                 success: false,
             });
             let outgoing_msg = Outgoing {
-                dest: Destination::Leader,
+                dest: Destination::Node(leader_id),
                 msg: response,
             };
             warn!(
@@ -812,7 +832,10 @@ impl Server {
             return Ok(());
         }
 
-        let i = incoming.from.as_usize();
+        let Id::Peer(peer_id) = incoming.from else {
+            return Ok(());
+        };
+        let i = peer_id.as_usize();
 
         if msg.success {
             // If successful: update nextIndex and matchIndex for follower
@@ -843,7 +866,7 @@ impl Server {
 
             self.to_network
                 .send(Outgoing {
-                    dest: Destination::Node(incoming.from),
+                    dest: Destination::Node(peer_id),
                     msg: Message::AppendEntriesType(AppendEntries {
                         term: self.state.current_term,
                         leader_id: self.id,
@@ -997,7 +1020,7 @@ mod tests {
     async fn populate_follower_log(mock_adapter_tx: &mpsc::Sender<Incoming>) {
         mock_adapter_tx
             .send(Incoming {
-                from: NodeId(67),
+                from: Id::Peer(NodeId(67)),
                 msg: Message::AppendEntriesType(AppendEntries {
                     term: 1,
                     leader_id: NodeId(1),
@@ -1035,7 +1058,7 @@ mod tests {
         let (mut server, mock_adapter_tx, _) = create_new_server_and_mock_msg_sender();
         mock_adapter_tx
             .send(Incoming {
-                from: NodeId(67),
+                from: Id::Peer(NodeId(67)),
                 msg: Message::AppendEntriesType(AppendEntries {
                     term: 1,
                     leader_id: NodeId(1),
@@ -1071,7 +1094,7 @@ mod tests {
         //send an AppendEntries RPC with a conflicting log entry
         mock_adapter_tx
             .send(Incoming {
-                from: NodeId(67),
+                from: Id::Peer(NodeId(67)),
                 msg: Message::AppendEntriesType(AppendEntries {
                     term: 1,
                     leader_id: NodeId(1),
@@ -1139,7 +1162,7 @@ mod tests {
         };
         mock_adapter_tx
             .send(Incoming {
-                from: NodeId(67),
+                from: Id::Peer(NodeId(67)),
                 msg: Message::AppendEntriesType(AppendEntries {
                     term: 1,
                     leader_id: NodeId(1),
@@ -1182,7 +1205,7 @@ mod tests {
 
         mock_adapter_tx
             .send(Incoming {
-                from: NodeId(67),
+                from: Id::Peer(NodeId(67)),
                 msg: Message::RequestVoteType(RequestVote {
                     term: 2,
                     candidate_id: NodeId(2),
@@ -1224,7 +1247,7 @@ mod tests {
         });
         mock_adapter_tx
             .send(Incoming {
-                from: NodeId(99),
+                from: Id::Peer(NodeId(99)),
                 msg: heartbeat,
             })
             .await
@@ -1263,7 +1286,7 @@ mod tests {
         });
         mock_adapter_tx
             .send(Incoming {
-                from: NodeId(99),
+                from: Id::Peer(NodeId(99)),
                 msg: heartbeat,
             })
             .await
@@ -1302,7 +1325,7 @@ mod tests {
         });
         mock_adapter_tx
             .send(Incoming {
-                from: NodeId(67),
+                from: Id::Peer(NodeId(67)),
                 msg: higher_term_msg,
             })
             .await
@@ -1337,7 +1360,7 @@ mod tests {
 
             mock_adapter_tx
                 .send(Incoming {
-                    from: NodeId(67),
+                    from: Id::Peer(NodeId(67)),
                     msg: higher_term_msg,
                 })
                 .await
@@ -1373,7 +1396,7 @@ mod tests {
         for _ in 0..(server.config.total_nodes / 2) + 1 {
             mock_adapter_tx
                 .send(Incoming {
-                    from: NodeId(67),
+                    from: Id::Peer(NodeId(67)),
                     msg: Message::RequestVoteResponseType(RequestVoteResponse {
                         term: server.state.current_term,
                         vote_granted: true,
@@ -1401,7 +1424,7 @@ mod tests {
         //first send client request, success response from nodes to leader in order
         //also send highre term msg to stop leader later
         let client_request = Incoming {
-            from: NodeId(67),
+            from: Id::Peer(NodeId(67)),
             msg: Message::ClientRequestType(ClientRequest {
                 request_id: 67,
                 client_id: 6,
@@ -1413,21 +1436,21 @@ mod tests {
         };
 
         let node_1_response = Incoming {
-            from: NodeId(1),
+            from: Id::Peer(NodeId(1)),
             msg: Message::AppendEntriesResponseType(AppendEntriesResponse {
                 term: server.state.current_term,
                 success: true,
             }),
         };
         let node_2_response = Incoming {
-            from: NodeId(2),
+            from: Id::Peer(NodeId(2)),
             msg: Message::AppendEntriesResponseType(AppendEntriesResponse {
                 term: server.state.current_term,
                 success: true,
             }),
         };
         let node_3_response = Incoming {
-            from: NodeId(3),
+            from: Id::Peer(NodeId(3)),
             msg: Message::AppendEntriesResponseType(AppendEntriesResponse {
                 term: server.state.current_term,
                 success: true,
@@ -1435,7 +1458,7 @@ mod tests {
         };
 
         let higher_term_msg = Incoming {
-            from: NodeId(67),
+            from: Id::Peer(NodeId(8)),
             msg: Message::AppendEntriesType(AppendEntries {
                 term: server.state.current_term + 1,
                 leader_id: NodeId(4),
@@ -1472,7 +1495,7 @@ mod tests {
         //client sends request, leader sends AppendEntries rpcs,
         //we simulate that only 2 nodes respond with success
         let client_request1 = Incoming {
-            from: NodeId(67),
+            from: Id::Peer(NodeId(67)),
             msg: Message::ClientRequestType(ClientRequest {
                 request_id: 67,
                 client_id: 6,
@@ -1484,14 +1507,14 @@ mod tests {
         };
 
         let node_1_response = Incoming {
-            from: NodeId(1),
+            from: Id::Peer(NodeId(1)),
             msg: Message::AppendEntriesResponseType(AppendEntriesResponse {
                 term: server.state.current_term,
                 success: true,
             }),
         };
         let node_2_response = Incoming {
-            from: NodeId(2),
+            from: Id::Peer(NodeId(2)),
             msg: Message::AppendEntriesResponseType(AppendEntriesResponse {
                 term: server.state.current_term,
                 success: true,
@@ -1500,7 +1523,7 @@ mod tests {
         //node 3 crashed, sends no response
 
         let higher_term_msg = Incoming {
-            from: NodeId(67),
+            from: Id::Peer(NodeId(67)),
             msg: Message::AppendEntriesType(AppendEntries {
                 term: server.state.current_term + 1,
                 leader_id: NodeId(4),
@@ -1534,7 +1557,7 @@ mod tests {
         //leader will reduce nextIndex for that node and send AppendEntries rpc with missing entries
         //happens until prev_log_index matches [will match in just 1 round in this case]
         let client_request2 = Incoming {
-            from: NodeId(69),
+            from: Id::Peer(NodeId(69)),
             msg: Message::ClientRequestType(ClientRequest {
                 request_id: 69,
                 client_id: 7,
@@ -1545,14 +1568,14 @@ mod tests {
             }),
         };
         let node_1_response2 = Incoming {
-            from: NodeId(1),
+            from: Id::Peer(NodeId(1)),
             msg: Message::AppendEntriesResponseType(AppendEntriesResponse {
                 term: server.state.current_term,
                 success: true,
             }),
         };
         let node_2_response2 = Incoming {
-            from: NodeId(2),
+            from: Id::Peer(NodeId(2)),
             msg: Message::AppendEntriesResponseType(AppendEntriesResponse {
                 term: server.state.current_term,
                 success: true,
@@ -1560,7 +1583,7 @@ mod tests {
         };
         //node 3 sends failure response
         let node_3_second_log_failure = Incoming {
-            from: NodeId(3),
+            from: Id::Peer(NodeId(3)),
             msg: Message::AppendEntriesResponseType(AppendEntriesResponse {
                 term: server.state.current_term,
                 success: false,
@@ -1570,14 +1593,14 @@ mod tests {
         //Node3 after recieving missing entries from leader in the latest appendEntries request
         //will send success this time
         let node_3_second_log_success = Incoming {
-            from: NodeId(3),
+            from: Id::Peer(NodeId(3)),
             msg: Message::AppendEntriesResponseType(AppendEntriesResponse {
                 term: server.state.current_term,
                 success: true,
             }),
         };
         let higher_term_msg = Incoming {
-            from: NodeId(67),
+            from: Id::Peer(NodeId(67)),
             msg: Message::AppendEntriesType(AppendEntries {
                 term: server.state.current_term + 1,
                 leader_id: NodeId(4),
@@ -1618,7 +1641,7 @@ mod tests {
 
         mock_adapter_tx
             .send(Incoming {
-                from: NodeId(3),
+                from: Id::Peer(NodeId(3)),
                 msg: Message::AppendEntriesResponseType(AppendEntriesResponse {
                     term: server.state.current_term - 1,
                     success: true,
@@ -1628,7 +1651,7 @@ mod tests {
             .unwrap();
         mock_adapter_tx
             .send(Incoming {
-                from: NodeId(67),
+                from: Id::Peer(NodeId(67)),
                 msg: Message::AppendEntriesType(AppendEntries {
                     term: server.state.current_term + 1,
                     leader_id: NodeId(1),
