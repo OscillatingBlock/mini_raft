@@ -1,8 +1,10 @@
-use crate::server::{LogCommand, LogEntry, NodeId};
+use crate::server::{ClientId, LogCommand, LogEntry, NodeId};
+use bytes::{Buf, BufMut, BytesMut};
+use serde::{Deserialize, Serialize};
+use tokio::io;
+use tokio_util::codec::{Decoder, Encoder};
 
-pub struct MessageCodec {}
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Message {
     AppendEntriesType(AppendEntries),
     AppendEntriesResponseType(AppendEntriesResponse),
@@ -10,6 +12,8 @@ pub enum Message {
     RequestVoteResponseType(RequestVoteResponse),
     ClientRequestType(ClientRequest),
     ClientResponseType(ClientResponse),
+    HelloType(Hello),
+    HelloClientType(HelloClient),
 }
 
 impl Message {
@@ -21,11 +25,13 @@ impl Message {
             Message::RequestVoteResponseType(_) => "RequestVoteResponseType".to_string(),
             Message::ClientRequestType(_) => "ClientRequestType".to_string(),
             Message::ClientResponseType(_) => "ClientResponseType".to_string(),
+            Message::HelloType(_) => "HelloType".to_string(),
+            Message::HelloClientType(_) => "HelloClientType".to_string(),
         }
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppendEntries {
     pub term: u32,
     pub leader_id: NodeId,
@@ -35,13 +41,13 @@ pub struct AppendEntries {
     pub leader_commit: i32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppendEntriesResponse {
     pub term: u32,
     pub success: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestVote {
     pub term: u32,
     pub candidate_id: NodeId,
@@ -49,20 +55,30 @@ pub struct RequestVote {
     pub last_log_term: u32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestVoteResponse {
     pub term: u32,
     pub vote_granted: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientRequest {
     pub command: LogCommand,
     pub client_id: u32,
     pub request_id: u32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Hello {
+    pub id: NodeId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HelloClient {
+    pub id: ClientId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientResponse {
     // Success responses for each operation
     GetSuccess {
@@ -91,26 +107,47 @@ pub enum ClientResponse {
     },
 }
 
-// pub enum MessageType {
-//
-// }
-pub trait Decoder {
-    type Item;
-    type Error;
+#[derive(Clone)]
+pub struct Codec;
 
-    // Transforms raw bytes into a high-level Message
-    fn decode(&mut self, src: &mut bytes::Bytes) -> Result<Option<Self::Item>, Self::Error>;
+impl Encoder<Message> for Codec {
+    type Error = io::Error;
+    fn encode(&mut self, item: Message, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        let payload =
+            serde_json::to_vec(&item).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        dst.put_u32(payload.len() as u32);
+        dst.put_slice(&payload);
+        Ok(())
+    }
 }
 
-pub trait Encoder {
-    type Error;
-    fn encode(&mut self) -> Result<Option<bytes::Bytes>, Self::Error>;
-}
-
-impl Decoder for MessageCodec {
+impl Decoder for Codec {
     type Item = Message;
-    type Error = anyhow::Error;
-    fn decode(&mut self, _src: &mut bytes::Bytes) -> Result<Option<Message>, Self::Error> {
-        !unimplemented!()
+    type Error = io::Error;
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        // 4 byte length header
+        if src.len() < 4 {
+            //not enough bytes yet
+            return Ok(None);
+        }
+
+        let len = u32::from_be_bytes([src[1], src[2], src[3], src[4]]) as usize;
+        let frame_len = 4 + len;
+
+        if src.len() < frame_len {
+            src.reserve(frame_len - src.len());
+            //not enough bytes yet
+            return Ok(None);
+        }
+
+        let mut frame = src.split_to(frame_len);
+        //skip header
+        frame.advance(4);
+
+        let msg: Message = serde_json::from_slice(&frame)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        Ok(Some(msg))
     }
 }
