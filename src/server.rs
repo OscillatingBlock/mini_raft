@@ -6,7 +6,6 @@ use crate::{
     config::ServerConfig,
 };
 use anyhow::{Context, Ok};
-use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time::Duration};
 use tokio::{
@@ -55,9 +54,12 @@ pub struct ServerState {
 
 impl ServerState {
     pub fn new(state_machine: Arc<dyn StateMachine>, num_peers: usize) -> Self {
-        let last_sent_index = vec![0; num_peers];
-        let next_index = vec![0; num_peers];
-        let match_index = vec![-1 as i32; num_peers];
+        // +1 so 1-based NodeIds (1..=total_nodes from config.toml) index safely.
+        // Index 0 is unused in that scheme; 0-based ids (tests) work too.
+        let size = num_peers + 1;
+        let last_sent_index = vec![0; size];
+        let next_index = vec![0; size];
+        let match_index = vec![-1 as i32; size];
         Self {
             state: RaftState::Follower,
             state_machine,
@@ -86,12 +88,9 @@ pub enum RaftState {
 }
 
 #[derive(Clone, Copy, PartialEq, PartialOrd, Debug, Eq, Hash, Serialize, Deserialize)]
-pub struct NodeId(u32);
+pub struct NodeId(u64);
 
 impl NodeId {
-    fn as_u64(&self) -> u64 {
-        return self.0 as u64;
-    }
     fn as_usize(&self) -> usize {
         return self.0 as usize;
     }
@@ -104,7 +103,7 @@ impl std::fmt::Display for NodeId {
 }
 
 impl NodeId {
-    pub fn new(id: u32) -> Self {
+    pub fn new(id: u64) -> Self {
         Self(id)
     }
 }
@@ -136,6 +135,12 @@ pub enum Destination {
 #[derive(Eq, Hash, PartialEq, Debug, Clone, Serialize, Deserialize, Copy)]
 pub struct ClientId(u32);
 
+impl ClientId {
+    pub fn new(id: u32) -> Self {
+        Self(id)
+    }
+}
+
 #[allow(dead_code)]
 pub struct Outgoing {
     pub dest: Destination,
@@ -151,7 +156,7 @@ pub struct Incoming {
 
 #[allow(dead_code)]
 impl Server {
-    fn new(
+    pub fn new(
         id: NodeId,
         config: ServerConfig,
         state_machine: Arc<dyn StateMachine>,
@@ -172,13 +177,13 @@ impl Server {
     }
 
     #[instrument(skip(self), fields(node_id = %self.id))]
-    fn run(&self) {
+    pub async fn run(&mut self) {
         info!("starting server main loop");
         loop {
             match self.state.state {
-                RaftState::Follower => {}
-                RaftState::Candidate => {}
-                RaftState::Leader => {}
+                RaftState::Follower => self.follower().await,
+                RaftState::Candidate => self.candidate().await,
+                RaftState::Leader => self.leader().await,
             }
         }
     }
@@ -186,9 +191,10 @@ impl Server {
     #[instrument(skip(self), fields(node_id = %self.id))]
     async fn follower(&mut self) {
         info!("entering follower state");
-        self.apply_latest_commited_logs(self.state.commit_index)
+        _ = self
+            .apply_latest_commited_logs(self.state.commit_index)
             .await;
-        let timeout_duration = self.config.election_timeout;
+        let timeout_duration = self.config.election_timeout_duration();
 
         loop {
             tokio::select! {
@@ -215,8 +221,7 @@ impl Server {
             "starting new election as candidate"
         );
 
-        let mut timeout_duration = self.config.election_timeout;
-        let mut rng = rand::rng();
+        let mut timeout_duration = self.config.election_timeout_duration();
 
         loop {
             // send request_vote rpcs to all other server
@@ -235,7 +240,8 @@ impl Server {
                 }
                 _ = set_timer(timeout_duration.clone()) => {
                     warn!("candidate election timeout expired, restarting election");
-                    timeout_duration += Duration::from_micros(rng.random_range(0..500));
+                    // Fresh OS-seeded jitter each timeout; no RNG held across .await so future stays Send.
+                    timeout_duration += Duration::from_micros(rand::random_range(0..500));
                 }
             }
         }
@@ -268,7 +274,8 @@ impl Server {
     #[instrument(skip(self), fields(node_id = %self.id))]
     async fn leader(&mut self) {
         info!("entering leader state");
-        self.apply_latest_commited_logs(self.state.commit_index)
+        _ = self
+            .apply_latest_commited_logs(self.state.commit_index)
             .await;
 
         // upon election send first heartbeat to all peers
@@ -276,12 +283,12 @@ impl Server {
 
         self.state
             .match_index
-            .resize(self.config.total_nodes as usize, -1);
+            .resize(self.config.total_nodes as usize + 1, -1);
         self.state
             .next_index
-            .resize(self.config.total_nodes as usize, 0);
+            .resize(self.config.total_nodes as usize + 1, 0);
 
-        for i in 0..self.config.total_nodes {
+        for i in 0..=self.config.total_nodes {
             self.state.next_index[i as usize] = if self.state.last_applied < 0 {
                 0
             } else {
@@ -293,7 +300,7 @@ impl Server {
             self.handle_commit_index().await;
 
             tokio::select! {
-                _ = set_timer(self.config.heartbeat_interval) => {
+                _ = set_timer(self.config.heartbeat_interval_duration()) => {
                     if self.state.state == RaftState::Leader {
                         debug!("heartbeat interval reached, sending heartbeat");
                         self.send_heartbeat().await;
@@ -425,7 +432,7 @@ impl Server {
             return Ok(());
         }
 
-        self.apply_latest_commited_logs(msg.leader_commit).await;
+        _ = self.apply_latest_commited_logs(msg.leader_commit).await;
 
         if msg.entries.is_empty() {
             debug!("received valid empty heartbeat from leader");
@@ -687,33 +694,38 @@ impl Server {
 
     // applies latest commited logs to state machine
     #[instrument(skip(self), fields(node_id = %self.id))]
-    async fn apply_latest_commited_logs(&mut self, leader_commit: i32) {
+    async fn apply_latest_commited_logs(&mut self, leader_commit: i32) -> anyhow::Result<()> {
+        // Advance commit_index, clamped to our last log index.
         if leader_commit > self.state.commit_index {
-            self.state.commit_index = leader_commit;
-            if self.state.commit_index > self.state.last_applied {
-                for i in self.state.commit_index..self.state.last_applied {
-                    let log = self.log.get(i as usize);
-                    let Some(log) = log else {
-                        continue;
-                    };
-
-                    self.state.last_applied += 1;
-                    debug!(
-                        last_applied = self.state.last_applied,
-                        "applying committed log to state machine"
-                    );
-                    match log.command.clone() {
-                        LogCommand::Set { key, value } => {
-                            self.state.state_machine.apply_log(key, value);
-                        }
-                        LogCommand::Delete { key } => {
-                            self.state.state_machine.delete_key(key);
-                        }
-                        _ => {}
-                    }
-                }
+            let last_idx = self.log.len() as i32 - 1;
+            if last_idx >= 0 {
+                self.state.commit_index = std::cmp::min(leader_commit, last_idx);
             }
         }
+        // Apply every committed-but-unapplied entry in order.
+        while self.state.last_applied < self.state.commit_index {
+            let next = self.state.last_applied + 1;
+            let Some(log) = self.log.get(next as usize).cloned() else {
+                break;
+            };
+
+            debug!(
+                last_applied = next,
+                "applying committed log to state machine"
+            );
+            match log.command.clone() {
+                LogCommand::Set { key, value } => {
+                    self.state.state_machine.apply_log(key, value)?;
+                }
+                LogCommand::Delete { key } => {
+                    self.state.state_machine.delete_key(key)?;
+                }
+                _ => {}
+            }
+            self.state.last_applied = next;
+        }
+
+        Ok(())
     }
 
     #[instrument(skip(self, msg), fields(node_id = %self.id, client_id = msg.client_id, request_id = msg.request_id))]
@@ -766,7 +778,7 @@ impl Server {
         );
         self.log.push(log_entry.clone());
 
-        for (peer_id, _) in &self.config.peer_addresses {
+        for (peer_id, _) in &self.config.peer_node_addresses() {
             if *peer_id == self.id {
                 continue;
             }
@@ -923,7 +935,8 @@ impl Server {
         if msg.success && commit_index_updated {
             for n in self.state.last_applied + 1..=self.state.commit_index {
                 debug!(log_index = n, "applying committed log to state machine");
-                self.apply_latest_commited_logs(self.state.commit_index)
+                _ = self
+                    .apply_latest_commited_logs(self.state.commit_index)
                     .await;
             }
             self.state.last_applied = self.state.commit_index;
@@ -987,19 +1000,22 @@ mod tests {
             .try_init();
 
         let mut peer_addreses = HashMap::new();
-        peer_addreses.insert(NodeId(0), "localhost:8080".to_string());
+        peer_addreses.insert(0, "localhost:8080".to_string());
 
-        peer_addreses.insert(NodeId(1), "localhost:8080".to_string());
-        peer_addreses.insert(NodeId(2), "localhost:8080".to_string());
-        peer_addreses.insert(NodeId(3), "localhost:8080".to_string());
+        peer_addreses.insert(1, "localhost:8080".to_string());
+        peer_addreses.insert(2, "localhost:8080".to_string());
+        peer_addreses.insert(3, "localhost:8080".to_string());
 
         let node_id = NodeId(0);
         let config = ServerConfig {
-            election_timeout: tokio::time::Duration::from_millis(200),
-            heartbeat_interval: tokio::time::Duration::from_millis(50),
+            election_timeout: 200,
+            heartbeat_interval: 50,
             address: "localhost:8080".to_string(),
             total_nodes: 5,
             peer_addresses: peer_addreses,
+            node_id: 0,
+            client_listener_address: "127.0.0.1:8080".to_string(),
+            peer_listener_address: "127.0.0.1:9001".to_string(),
         };
         let state_machine = SimpleStateMachine::new();
         let server_state_machine =
@@ -1347,8 +1363,9 @@ mod tests {
         // spawn a task , which sends a heartbeat after 3 heartbeat intervals to current leader
         // telling current leader that its not leader anymore ,
         // do this to stop the leader loop
+        let heartbeat_duration = server.config.heartbeat_interval_duration();
         tokio::task::spawn(async move {
-            tokio::time::sleep(server.config.heartbeat_interval * 3).await;
+            tokio::time::sleep(heartbeat_duration * 3).await;
             let higher_term_msg = Message::AppendEntriesType(AppendEntries {
                 term: server.state.current_term + 1,
                 leader_id: NodeId(4),

@@ -110,6 +110,12 @@ pub enum ClientResponse {
 #[derive(Clone)]
 pub struct Codec;
 
+impl Codec {
+    pub fn new() -> Self {
+        Codec {}
+    }
+}
+
 impl Encoder<Message> for Codec {
     type Error = io::Error;
     fn encode(&mut self, item: Message, dst: &mut BytesMut) -> Result<(), Self::Error> {
@@ -132,7 +138,7 @@ impl Decoder for Codec {
             return Ok(None);
         }
 
-        let len = u32::from_be_bytes([src[1], src[2], src[3], src[4]]) as usize;
+        let len = u32::from_be_bytes([src[0], src[1], src[2], src[3]]) as usize;
         let frame_len = 4 + len;
 
         if src.len() < frame_len {

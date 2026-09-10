@@ -19,7 +19,6 @@ pub struct NetworkManager {
     connections_map: ConnectionRegistry,
     codec: Codec,
     to_server: Arc<Mutex<mpsc::Sender<Incoming>>>,
-    from_server: mpsc::Receiver<Outgoing>,
     id: NodeId,
 }
 
@@ -28,57 +27,32 @@ pub struct ConnectionRegistry {
     client_registry: Arc<Mutex<HashMap<ClientId, mpsc::Sender<Message>>>>,
 }
 
+impl ConnectionRegistry {
+    fn new() -> Self {
+        let peer_registry_map: HashMap<NodeId, mpsc::Sender<Message>> = HashMap::new();
+        let client_registry_map: HashMap<ClientId, mpsc::Sender<Message>> = HashMap::new();
+        Self {
+            peer_registry: Arc::new(Mutex::new(peer_registry_map)),
+            client_registry: Arc::new(Mutex::new(client_registry_map)),
+        }
+    }
+}
+
 use tracing::{debug, error, info, instrument, warn};
 
 impl NetworkManager {
-    #[instrument(skip(self))]
-    async fn dispatch_msg_from_server(&mut self) {
-        while let Some(msg) = self.from_server.recv().await {
-            match msg.dest {
-                Destination::Node(node_id) => {
-                    let id = Id::Peer(node_id);
-                    debug!(target: "network", node_id = ?node_id, "dispatching server message to peer node");
-                    self.dispatch_msg(id, msg.msg).await;
-                }
-                Destination::Client(client_id) => {
-                    let id = Id::Client(client_id);
-                    debug!(target: "network", client_id = ?client_id, "dispatching server message to client");
-                    self.dispatch_msg(id, msg.msg).await;
-                }
-                Destination::Broadcast => {
-                    let guard = self.connections_map.peer_registry.lock().await;
-                    let nodes: Vec<_> = guard.keys().cloned().collect();
-                    drop(guard);
-                    info!(target: "network", peer_count = nodes.len(), "broadcasting message to all connected peers");
-                    for node_id in nodes {
-                        self.dispatch_msg(Id::Peer(node_id), msg.msg.clone()).await;
-                    }
-                }
-            }
-        }
-    }
-
-    #[instrument(skip(self, msg), fields(node_id = ?self.id))]
-    async fn dispatch_msg(&self, id: Id, msg: Message) {
-        let client_guard = self.connections_map.client_registry.lock().await;
-        let peer_guard = self.connections_map.peer_registry.lock().await;
-
-        let tx = match id {
-            Id::Client(client_id) => client_guard.get(&client_id),
-            Id::Peer(peer_id) => peer_guard.get(&peer_id),
-        };
-        let Some(tx) = tx else {
-            warn!(target: "network", ?id, "failed to dispatch message: writer channel not available");
-            return;
-        };
-
-        if let Err(e) = tx.send(msg).await {
-            error!(target: "network", ?id, error = %e, "connection handler exited and dropped write channel end");
+    pub fn new(to_server: mpsc::Sender<Incoming>, codec: Codec, id: NodeId) -> Self {
+        let to_server = Arc::new(Mutex::new(to_server));
+        Self {
+            connections_map: ConnectionRegistry::new(),
+            codec,
+            to_server,
+            id,
         }
     }
 
     #[instrument(skip(self, listener), fields(node_id = ?self.id))]
-    async fn listener(&self, listener: TcpListener) -> anyhow::Result<()> {
+    pub async fn listen(&self, listener: TcpListener) -> anyhow::Result<()> {
         info!(target: "network", "starting inbound TCP listener");
         loop {
             let (conn, addr) = match listener.accept().await {
@@ -158,14 +132,32 @@ impl NetworkManager {
     }
 
     #[instrument(skip(self, peer_addresses), fields(node_id = ?current_node_id))]
-    async fn dial_peers(&self, peer_addresses: HashMap<NodeId, String>, current_node_id: NodeId) {
+    pub async fn dial_peers(
+        &self,
+        peer_addresses: HashMap<NodeId, String>,
+        current_node_id: NodeId,
+    ) {
         for (peer_id, addr) in peer_addresses {
             if peer_id > current_node_id {
                 debug!(target: "network", peer_id = ?peer_id, %addr, "attempting to dial remote peer");
-                let conn = match TcpStream::connect(&addr).await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        error!(target: "network", peer_id = ?peer_id, %addr, error = %e, "failed to establish TCP connection with peer");
+                // Retry: peers may not be listening yet at boot (sequential startup).
+                let mut conn_opt = None;
+                for attempt in 1..=6 {
+                    match TcpStream::connect(&addr).await {
+                        Ok(c) => {
+                            conn_opt = Some(c);
+                            break;
+                        }
+                        Err(e) => {
+                            error!(target: "network", peer_id = ?peer_id, %addr, error = %e, attempt, "failed to establish TCP connection with peer, retrying");
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                        }
+                    }
+                }
+                let conn = match conn_opt {
+                    Some(c) => c,
+                    None => {
+                        error!(target: "network", peer_id = ?peer_id, %addr, "giving up dialing peer after retries");
                         continue;
                     }
                 };
@@ -266,4 +258,51 @@ async fn framed_writer(
         }
     }
     debug!(target: "network", "server-to-connection channel dropped, writer terminating");
+}
+
+pub async fn dispatch_server_msg(
+    mut from_server: mpsc::Receiver<Outgoing>,
+    network_manager: Arc<NetworkManager>,
+) {
+    while let Some(msg) = from_server.recv().await {
+        match msg.dest {
+            Destination::Node(node_id) => {
+                let id = Id::Peer(node_id);
+                debug!(target: "network", node_id = ?node_id, "dispatching server message to peer node");
+                dispatch_msg(id, msg.msg, network_manager.clone()).await;
+            }
+            Destination::Client(client_id) => {
+                let id = Id::Client(client_id);
+                debug!(target: "network", client_id = ?client_id, "dispatching server message to client");
+                dispatch_msg(id, msg.msg, network_manager.clone()).await;
+            }
+            Destination::Broadcast => {
+                let guard = network_manager.connections_map.peer_registry.lock().await;
+                let nodes: Vec<_> = guard.keys().cloned().collect();
+                drop(guard);
+                info!(target: "network", peer_count = nodes.len(), "broadcasting message to all connected peers");
+                for node_id in nodes {
+                    dispatch_msg(Id::Peer(node_id), msg.msg.clone(), network_manager.clone()).await;
+                }
+            }
+        }
+    }
+}
+
+async fn dispatch_msg(id: Id, msg: Message, network_manager: Arc<NetworkManager>) {
+    let client_guard = network_manager.connections_map.client_registry.lock().await;
+    let peer_guard = network_manager.connections_map.peer_registry.lock().await;
+
+    let tx = match id {
+        Id::Client(client_id) => client_guard.get(&client_id),
+        Id::Peer(peer_id) => peer_guard.get(&peer_id),
+    };
+    let Some(tx) = tx else {
+        warn!(target: "network", ?id, "failed to dispatch message: writer channel not available");
+        return;
+    };
+
+    if let Err(e) = tx.send(msg).await {
+        error!(target: "network", ?id, error = %e, "connection handler exited and dropped write channel end");
+    }
 }
