@@ -141,28 +141,12 @@ impl NetworkManager {
             if peer_id > current_node_id {
                 debug!(target: "network", peer_id = ?peer_id, %addr, "attempting to dial remote peer");
                 // Retry: peers may not be listening yet at boot (sequential startup).
-                let mut conn_opt = None;
-                for attempt in 1..=6 {
-                    match TcpStream::connect(&addr).await {
-                        Ok(c) => {
-                            conn_opt = Some(c);
-                            break;
-                        }
-                        Err(e) => {
-                            error!(target: "network", peer_id = ?peer_id, %addr, error = %e, attempt, "failed to establish TCP connection with peer, retrying");
-                            tokio::time::sleep(Duration::from_millis(500)).await;
-                        }
-                    }
-                }
-                let conn = match conn_opt {
-                    Some(c) => c,
-                    None => {
-                        error!(target: "network", peer_id = ?peer_id, %addr, "giving up dialing peer after retries");
-                        continue;
-                    }
+                let Some(conn) = self.connect_with_rety(addr, peer_id).await else {
+                    continue;
                 };
 
                 let mut framed = Framed::new(conn, self.codec.clone());
+
                 match self.perform_handshake(&mut framed).await {
                     Ok(Some(peer_node_id)) => {
                         info!(target: "network", peer_id = ?peer_node_id, "peer dial and handshake completed successfully");
@@ -178,6 +162,29 @@ impl NetworkManager {
                 }
             }
         }
+    }
+
+    async fn connect_with_rety(&self, addr: String, peer_id: NodeId) -> Option<TcpStream> {
+        let mut conn_opt = None;
+        for attempt in 1..=6 {
+            match TcpStream::connect(&addr).await {
+                Ok(c) => {
+                    conn_opt = Some(c);
+                    break;
+                }
+                Err(e) => {
+                    error!(target: "network", peer_id = ?peer_id, %addr, error = %e, attempt, "failed to establish TCP connection with peer, retrying");
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            }
+        }
+
+        let Some(c) = conn_opt else {
+            error!(target: "network", peer_id = ?peer_id, %addr, "giving up dialing peer after retries");
+            return None;
+        };
+
+        return Some(c);
     }
 
     #[instrument(skip(self, conn), fields(node_id = ?self.id, ?id))]
