@@ -37,19 +37,15 @@ pub struct ServerState {
     state: RaftState,
     state_machine: Arc<dyn StateMachine>,
 
-    current_term: u32,
     voted_for: Option<NodeId>,
+    last_heartbeat: Instant,
+
+    current_term: u32,
     commit_index: i32,
     last_applied: i32,
 
-    next_index: Vec<u64>,
-    match_index: Vec<i32>,
     //highest log index sent to follower in the current AppendEntries rpc
     last_sent_index: Vec<i32>,
-
-    last_heartbeat: Instant,
-
-    votes_received: u32,
 }
 
 impl ServerState {
@@ -58,33 +54,33 @@ impl ServerState {
         // Index 0 is unused in that scheme; 0-based ids (tests) work too.
         let size = num_peers + 1;
         let last_sent_index = vec![0; size];
-        let next_index = vec![0; size];
-        let match_index = vec![-1 as i32; size];
         Self {
-            state: RaftState::Follower,
+            state: RaftState::Follower {},
             state_machine,
             current_term: 0,
+            // Sentinel value -1 is used because Rust vectors are 0-indexed.
+            // Since index 0 is a valid, real log entry, 0 cannot be used
+            // to represent "none." A negative sentinel cleanly distinguishes
+            // an uninitialized/empty state from actual log indexes.
+            commit_index: -1, // -1 means no log entries have been committed yet
+            last_applied: -1, // -1 means no log entries have been applied to the state machine yet
             voted_for: None,
-            //we use sentinel value -1 for commit_index, last_applied
-            //-1 -> uncommited state
-            commit_index: -1,
-            //-1 -> No logs applied
-            last_applied: -1,
-            next_index: next_index,
-            //all index set to -1 to represent no logs commited on followers yet
-            match_index: match_index,
-            last_sent_index: last_sent_index,
             last_heartbeat: Instant::now(),
-            votes_received: 0,
+            last_sent_index,
         }
     }
 }
 
 #[derive(PartialEq, Debug, Clone)]
 pub enum RaftState {
-    Follower,
-    Candidate,
-    Leader,
+    Follower {},
+    Candidate {
+        votes_received: u32,
+    },
+    Leader {
+        match_index: Vec<i32>,
+        next_index: Vec<u64>,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, PartialOrd, Debug, Eq, Hash, Serialize, Deserialize)]
@@ -180,10 +176,13 @@ impl Server {
     pub async fn run(&mut self) {
         info!("starting server main loop");
         loop {
-            match self.state.state {
-                RaftState::Follower => self.follower().await,
-                RaftState::Candidate => self.candidate().await,
-                RaftState::Leader => self.leader().await,
+            match &self.state.state {
+                RaftState::Follower {} => self.follower().await,
+                RaftState::Candidate { votes_received: _ } => self.candidate().await,
+                RaftState::Leader {
+                    match_index: _,
+                    next_index: _,
+                } => self.leader().await,
             }
         }
     }
@@ -203,7 +202,9 @@ impl Server {
                     break
                 }
                 _ = set_timer(timeout_duration.clone()) => {
-                    self.state.state = RaftState::Candidate;
+                    self.state.state = RaftState::Candidate{
+                        votes_received: 0,
+                    };
                     warn!("election timeout expired, transitioning from follower to candidate");
                     break
                 }
@@ -213,9 +214,12 @@ impl Server {
 
     #[instrument(skip(self), fields(node_id = %self.id))]
     async fn candidate(&mut self) {
-        self.state.current_term += 1;
-        self.state.last_heartbeat = Instant::now();
-        self.state.voted_for = Some(self.id.clone());
+        let RaftState::Candidate { votes_received: _ } = self.state.state else {
+            warn!("not a candidate, cant run candidate loop");
+            return;
+        };
+        self.become_candidate();
+
         info!(
             term = self.state.current_term,
             "starting new election as candidate"
@@ -233,10 +237,12 @@ impl Server {
                     // break the candidate loop
                     // either we recieved majority votes and became Leader
                     // or we discovered Leader and became follower
-                    if self.state.state != RaftState::Candidate {
+
+                    let RaftState::Candidate { votes_received : _ } = self.state.state else {
                         info!(new_state = ?self.state.state, "state changed during candidate phase, exiting loop");
                         break
-                    }
+                    };
+
                 }
                 _ = set_timer(timeout_duration.clone()) => {
                     warn!("candidate election timeout expired, restarting election");
@@ -274,48 +280,35 @@ impl Server {
     #[instrument(skip(self), fields(node_id = %self.id))]
     async fn leader(&mut self) {
         info!("entering leader state");
+
         _ = self
             .apply_latest_commited_logs(self.state.commit_index)
             .await;
 
         // upon election send first heartbeat to all peers
         self.send_heartbeat().await;
-
-        self.state
-            .match_index
-            .resize(self.config.total_nodes as usize + 1, -1);
-        self.state
-            .next_index
-            .resize(self.config.total_nodes as usize + 1, 0);
-
-        for i in 0..=self.config.total_nodes {
-            self.state.next_index[i as usize] = if self.state.last_applied < 0 {
-                0
-            } else {
-                self.state.last_applied as u64 + 1
-            };
-        }
+        self.become_leader();
 
         loop {
             self.handle_commit_index().await;
 
             tokio::select! {
                 _ = set_timer(self.config.heartbeat_interval_duration()) => {
-                    if self.state.state == RaftState::Leader {
-                        debug!("heartbeat interval reached, sending heartbeat");
-                        self.send_heartbeat().await;
-                    }else {
-                        debug!("breaking heartbeat loop");
-                        break;
-                    }
+                    debug!("heartbeat interval reached, sending heartbeat");
+                    self.send_heartbeat().await;
+
                 }
 
                 _ = self.recieve_rpc() => {
                     // if we discovered that we are no longer leader break leader loop
-                    if self.state.state != RaftState::Leader {
+                    let RaftState::Leader {
+                        match_index: _,
+                        next_index: _,
+                    } = &mut self.state.state
+                    else {
                         warn!(new_state = ?self.state.state, "no longer leader, stepping down");
                         break;
-                    }
+                    };
                 }
             }
         }
@@ -424,12 +417,17 @@ impl Server {
         }
 
         // if we are leader and msg term higher than our current term, then become follower
-        let prev_state = self.state.state.clone();
-        self.change_state_if_higher_term(&msg);
-        let new_state = self.state.state.clone();
 
-        if prev_state != new_state {
-            return Ok(());
+        if msg.term > self.state.current_term {
+            match self.state.state {
+                RaftState::Follower { .. } => {
+                    self.state.current_term = msg.term;
+                }
+                _ => {
+                    self.become_follower_if_higher_term(msg.term.clone());
+                    return Ok(());
+                }
+            }
         }
 
         _ = self.apply_latest_commited_logs(msg.leader_commit).await;
@@ -550,29 +548,26 @@ impl Server {
         }
     }
 
-    fn change_state_if_higher_term(&mut self, msg: &AppendEntries) {
+    fn become_follower_if_higher_term(&mut self, term: u32) {
         let prev_state = self.state.state.clone();
-        if msg.term > self.state.current_term {
-            self.state.current_term = msg.term;
-            self.state.state = RaftState::Follower;
+        self.become_follower(term);
 
-            match prev_state {
-                RaftState::Leader => {
-                    info!(
-                        old_term = self.state.current_term,
-                        new_term = msg.term,
-                        "discovered higher term, stepping down to follower"
-                    );
-                }
-                RaftState::Candidate => {
-                    info!(
-                        old_term = self.state.current_term,
-                        new_term = msg.term,
-                        "candidate discovered leader, stepping down to follower"
-                    );
-                }
-                _ => {}
+        match prev_state {
+            RaftState::Leader { .. } => {
+                info!(
+                    old_term = self.state.current_term,
+                    new_term = term,
+                    "Leader discovered higher term, stepping down to follower"
+                );
             }
+            RaftState::Candidate { .. } => {
+                info!(
+                    old_term = self.state.current_term,
+                    new_term = term,
+                    "Candidate discovered leader, stepping down to follower"
+                );
+            }
+            _ => {}
         }
     }
 
@@ -658,35 +653,44 @@ impl Server {
     #[instrument(skip(self, msg), fields(node_id = %self.id, term = msg.term))]
     async fn handle_request_vote_response_rpc(&mut self, msg: RequestVoteResponse) {
         debug!("handling request vote response rpc");
+        let RaftState::Candidate { votes_received } = &mut self.state.state else {
+            warn!("Ignoring handle request vote response rpc, as curent role not condidate");
+            return;
+        };
+
         if msg.term > self.state.current_term {
-            info!(
-                old_term = self.state.current_term,
-                new_term = msg.term,
-                "discovered higher term in vote response, becoming follower"
-            );
-            self.state.current_term = msg.term;
-            self.state.state = RaftState::Follower;
-            self.state.voted_for = None;
-            self.state.votes_received = 0;
+            self.become_follower_if_higher_term(msg.term);
             return;
         }
 
         if msg.vote_granted {
             // count votes
-            self.state.votes_received += 1;
+            *votes_received += 1;
             debug!(
-                votes_received = self.state.votes_received,
+                votes_received = votes_received,
                 "vote granted, tallying votes"
             );
             // if majority votes, become leader
-            if self.state.votes_received >= (self.config.total_nodes / 2) + 1 {
-                self.state.state = RaftState::Leader;
+            if *votes_received >= (self.config.total_nodes / 2) + 1 {
+                self.become_leader();
                 info!("candidate received majority votes, transitioning to leader");
             }
             // else stay candidate
         } else {
             debug!("vote denied by peer");
         }
+    }
+
+    fn become_leader(&mut self) {
+        let next_index_each = if self.state.last_applied < 0 {
+            0
+        } else {
+            self.state.last_applied as u64 + 1
+        };
+        self.state.state = RaftState::Leader {
+            match_index: vec![-1; self.config.total_nodes as usize + 1],
+            next_index: vec![next_index_each; self.config.total_nodes as usize + 1],
+        };
     }
 
     #[instrument(skip(self), fields(node_id = %self.id))]
@@ -730,10 +734,14 @@ impl Server {
 
     #[instrument(skip(self, msg), fields(node_id = %self.id, client_id = msg.client_id, request_id = msg.request_id))]
     async fn handle_client_request(&mut self, msg: ClientRequest) -> anyhow::Result<()> {
-        if self.state.state != RaftState::Leader {
+        let RaftState::Leader {
+            match_index: _,
+            next_index: _,
+        } = &self.state.state
+        else {
             debug!("ignoring client request: node is not the leader");
             return Ok(());
-        }
+        };
 
         info!("handling incoming client request");
 
@@ -760,6 +768,15 @@ impl Server {
         client_id: u32,
         request_id: u32,
     ) -> anyhow::Result<()> {
+        let RaftState::Leader {
+            match_index: _,
+            next_index,
+        } = &mut self.state.state
+        else {
+            warn!("not handling set command, current state not leader");
+            return Ok(());
+        };
+
         let log_entry = LogEntry {
             term: self.state.current_term,
             index: self.log.len() as u32,
@@ -783,10 +800,10 @@ impl Server {
                 continue;
             }
             let i = peer_id.as_usize();
-            let prev_log_index = if self.state.next_index[i] == 0 {
+            let prev_log_index = if next_index[i] == 0 {
                 -1 as i32
             } else {
-                self.state.next_index[i] as i32 - 1
+                next_index[i] as i32 - 1
             };
             let prev_log_term = if prev_log_index == -1 {
                 0
@@ -821,26 +838,21 @@ impl Server {
             return Ok(());
         };
 
-        if self.state.state != RaftState::Leader {
+        let RaftState::Leader {
+            match_index,
+            next_index,
+        } = &mut self.state.state
+        else {
             debug!("ignoring append entries response: node is no longer leader");
             return Ok(());
-        }
+        };
 
         debug!(peer_id = ?incoming.from, success = msg.success, term = msg.term, "received append entries response from peer");
 
         // If RPC response contains term T > currentTerm:
         // set currentTerm = T, convert to follower
         if msg.term > self.state.current_term {
-            info!(
-                old_term = self.state.current_term,
-                new_term = msg.term,
-                "discovered higher term in append entries response, becoming follower"
-            );
-            self.state.current_term = msg.term;
-            self.state.state = RaftState::Follower;
-            self.state.voted_for = None;
-            self.state.votes_received = 0;
-
+            self.become_follower_if_higher_term(msg.term);
             return Ok(());
         }
 
@@ -851,30 +863,30 @@ impl Server {
 
         if msg.success {
             // If successful: update nextIndex and matchIndex for follower
-            self.state.match_index[i] = self.state.last_sent_index[i];
-            self.state.next_index[i] = self.state.match_index[i] as u64 + 1;
+            match_index[i] = self.state.last_sent_index[i];
+            next_index[i] = match_index[i] as u64 + 1;
             debug!(
                 peer_id = ?incoming.from,
-                match_index = self.state.match_index[i],
-                next_index = self.state.next_index[i],
+                match_index = match_index[i],
+                next_index = next_index[i],
                 "updated follower indices on successful replication"
             );
         } else {
             // If AppendEntries fails because of log inconsistency: decrement nextIndex and retry
-            self.state.next_index[i] = if self.state.next_index[i] > 0 {
-                self.state.next_index[i] - 1
+            next_index[i] = if next_index[i] > 0 {
+                next_index[i] - 1
             } else {
                 0
             };
             warn!(
                 peer_id = ?incoming.from,
-                new_next_index = self.state.next_index[i],
+                new_next_index = next_index[i],
                 "append entries rejected due to log inconsistency, decrementing next_index and retrying"
             );
 
-            let prev_log_index = self.state.next_index[i] as i32;
+            let prev_log_index = next_index[i] as i32;
             let prev_log_term = self.log[prev_log_index as usize].term;
-            let entries = self.log[self.state.next_index[i] as usize..].to_vec();
+            let entries = self.log[next_index[i] as usize..].to_vec();
 
             self.to_network
                 .send(Outgoing {
@@ -911,7 +923,7 @@ impl Server {
             if self.log[n as usize].term == self.state.current_term {
                 let mut match_count = 0;
 
-                for match_index in self.state.match_index.iter() {
+                for match_index in match_index.iter() {
                     println!("match_index = {match_index}, match_count = {match_count}");
                     if *match_index >= n {
                         match_count += 1;
@@ -931,16 +943,21 @@ impl Server {
                 }
             }
         }
-
+        let commit_index = self.state.commit_index;
         if msg.success && commit_index_updated {
             for n in self.state.last_applied + 1..=self.state.commit_index {
                 debug!(log_index = n, "applying committed log to state machine");
-                _ = self
-                    .apply_latest_commited_logs(self.state.commit_index)
-                    .await;
+                _ = self.apply_latest_commited_logs(commit_index).await;
             }
+
             self.state.last_applied = self.state.commit_index;
-            self.state.match_index[self.id.as_usize()] = self.state.commit_index;
+            // Re-borrow match_index safely just before using it,
+            // since the previous references have finished their lifecycle.
+            let match_index = match &mut self.state.state {
+                RaftState::Leader { match_index, .. } => match_index,
+                _ => return Ok(()),
+            };
+            match_index[self.id.as_usize()] = self.state.commit_index;
 
             let log_entry = match self.log.get(self.state.commit_index as usize) {
                 Some(entry) => entry,
@@ -977,6 +994,18 @@ impl Server {
         }
 
         Ok(())
+    }
+
+    fn become_follower(&mut self, term: u32) {
+        self.state.current_term = term;
+        self.state.state = RaftState::Follower {};
+        self.state.voted_for = None;
+    }
+
+    fn become_candidate(&mut self) {
+        self.state.current_term += 1;
+        self.state.last_heartbeat = Instant::now();
+        self.state.voted_for = Some(self.id.clone());
     }
 }
 
@@ -1066,7 +1095,7 @@ mod tests {
         server.follower().await;
 
         let current_state = server.state.state;
-        assert_eq!(current_state, RaftState::Candidate);
+        assert_eq!(current_state, RaftState::Candidate { votes_received: 0 });
     }
 
     #[tokio::test]
@@ -1089,7 +1118,7 @@ mod tests {
 
         server.follower().await;
         let current_state = server.state.state;
-        assert_eq!(current_state, RaftState::Follower);
+        assert_eq!(current_state, RaftState::Follower {});
     }
 
     #[tokio::test]
@@ -1246,15 +1275,11 @@ mod tests {
         let (mut server, mock_adapter_tx, mut mock_adapter_rx) =
             create_new_server_and_mock_msg_sender();
 
-        populate_follower_log(&mock_adapter_tx).await;
         server.follower().await;
-
-        //receive the append entries response from the follower state
-        let _ = mock_adapter_rx.recv().await.unwrap();
 
         //already send an heartbeat so candidate loop ends in the next step when we start it
         let heartbeat = Message::AppendEntriesType(AppendEntries {
-            term: server.state.current_term,
+            term: server.state.current_term + 2,
             leader_id: NodeId(1),
             prev_log_index: 0,
             prev_log_term: 1,
@@ -1273,14 +1298,15 @@ mod tests {
         server.candidate().await;
 
         let request_vote_msg = mock_adapter_rx.recv().await.unwrap();
+
         let Message::RequestVoteType(req) = request_vote_msg.msg else {
             println!("Expected RequestVoteType, got {:?}", request_vote_msg.msg);
             panic!("Expected RequestVoteType")
         };
-        assert_eq!(req.term, server.state.current_term);
+        assert_eq!(req.term + 1, server.state.current_term);
         assert_eq!(req.candidate_id, server.id);
-        assert_eq!(req.last_log_index, server.log.len() as i32 - 1);
-        assert_eq!(req.last_log_term, server.log[server.log.len() - 1].term);
+        assert_eq!(req.last_log_index, 0);
+        assert_eq!(req.last_log_term, 0);
     }
 
     #[tokio::test]
@@ -1310,7 +1336,7 @@ mod tests {
 
         server.candidate().await;
 
-        assert_eq!(server.state.state, RaftState::Follower);
+        assert_eq!(server.state.state, RaftState::Follower {});
     }
 
     #[tokio::test]
@@ -1320,7 +1346,13 @@ mod tests {
 
         // follower -> candidate -> leader (if recieves majority vote)
         simulate_follower_becomes_leader(&mut server, &mock_adapter_tx, &mut mock_adapter_rx).await;
-        assert_eq!(server.state.state, RaftState::Leader);
+        assert_eq!(
+            server.state.state,
+            RaftState::Leader {
+                next_index: vec![0; server.config.total_nodes as usize + 1],
+                match_index: vec![-1; server.config.total_nodes as usize + 1]
+            }
+        );
     }
 
     #[tokio::test]
@@ -1350,7 +1382,7 @@ mod tests {
         //start leader loop
         server.leader().await;
 
-        assert_eq!(server.state.state, RaftState::Follower);
+        assert_eq!(server.state.state, RaftState::Follower {});
     }
 
     #[tokio::test]
@@ -1567,7 +1599,10 @@ mod tests {
 
         warn!("changing node state back to leader, for running further test");
         //after stopping leader state current node becomes Follower, make it leader again
-        server.state.state = RaftState::Leader;
+        server.state.state = RaftState::Leader {
+            match_index: vec![-1, server.config.total_nodes as i32 + 1],
+            next_index: vec![0, server.config.total_nodes as u64 + 1],
+        };
 
         //now client sends second request,after reciving this request leader sends AppendEntries rpc
         //and leader discovers that node 3 is missing previous log [index 0]
